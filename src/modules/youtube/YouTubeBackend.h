@@ -8,19 +8,20 @@
 #include <QVariantList>
 #include <QVariantMap>
 #include <QNetworkAccessManager>
+#include <QSet>
 
 // Backend for the YouTube module (V1 "feed" approach — no auth).
 //
 // The user lists channel IDs (one per line) in <dataRoot>/youtube_subscriptions.txt.
 // Video lists come from each channel's official RSS feed (titles, exact publish
 // dates, channel name — ~15 newest videos), fetched unauthenticated. Results are
-// cached in memory per channel for the session (kCacheTtlMs TTL), so the first
-// entry into Subscriptions or Channels fills the cache for every other view.
+// persisted in youtube_feed_cache.json and reused across restarts. Cached views
+// load immediately; selected channels refresh in the background for the next visit.
 //
 // Playlists come from <dataRoot>/youtube_playlists.txt (one playlist URL or ID
 // per line, optional "My Name | <url>" display-name prefix). RSS feeds for
 // playlists stop at 15 entries, so playlist contents are fetched by spawning
-// yt-dlp --flat-playlist instead (async QProcess, same session cache TTL).
+// yt-dlp --flat-playlist instead (async QProcess, same persistent cache).
 //
 // Two user files besides subscriptions/playlists:
 //   youtube_history.json     — watch history + resume positions, keyed by videoId
@@ -105,8 +106,11 @@ private:
     QVariantList loadWatchLater() const;
     void         saveWatchLater(const QVariantList &list);
 
+    void         loadFeedCache();
+    void         saveFeedCache() const;
+
     QStringList  readSubscriptionIds(QString *error = nullptr) const;
-    void         ensureFresh(bool forceRefresh);
+    void         ensureFresh(bool forceRefresh, const QString &selectedChannelId = QString());
     void         refreshChannel(const QString &channelId);
     void         finishAggregate();
     QVariantList buildFeed() const;
@@ -114,7 +118,7 @@ private:
     QNetworkRequest makeRequest(const QUrl &url) const;
 
     QList<PlaylistFileRef> readPlaylistEntries(QString *error = nullptr) const;
-    void         ensurePlaylistsFresh(bool forceRefresh);
+    void         ensurePlaylistsFresh(bool forceRefresh, const QString &selectedPlaylistId = QString());
     void         spawnNextPlaylistFetch();
     void         finishPlaylistAggregate();
     QVariantList buildPlaylistList() const;
@@ -123,9 +127,10 @@ private:
     QString m_dataRoot;
     QNetworkAccessManager m_nam;
 
-    QHash<QString, ChannelEntry> m_channels;  // in-memory session cache
+    QHash<QString, ChannelEntry> m_channels;  // backed by youtube_feed_cache.json
     QStringList m_channelOrder;               // channel IDs in file order (deduped)
     int m_pendingChannels = 0;
+    QSet<QString> m_channelFetches;
 
     // Emit-when-done flags: while one refresh is in flight, additional load
     // calls just queue their result signal on it instead of re-requesting.
@@ -138,13 +143,13 @@ private:
     QHash<QString, PlaylistEntry> m_playlists;
     QStringList m_playlistOrder;              // playlist IDs in file order (deduped)
     QStringList m_playlistFetchQueue;         // stale IDs waiting for a process slot
+    QSet<QString> m_playlistFetches;
     int m_pendingPlaylists       = 0;
     int m_activePlaylistFetches  = 0;
 
     bool    m_emitPlaylistsWhenDone = false;
     QString m_emitPlaylistVideosWhenDone;     // playlistId, or empty
 
-    static constexpr qint64 kCacheTtlMs      = 15 * 60 * 1000;
     static constexpr int    kMaxFeedItems    = 100;
     static constexpr int    kMaxHistoryItems = 100;
     static constexpr int    kMaxPlaylistItems = 500;             // caps infinite Mix/Radio lists

@@ -10,6 +10,7 @@
 #include <QNetworkRequest>
 #include <QProcess>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QTimer>
 #include <QUrl>
 #include <QXmlStreamReader>
@@ -26,6 +27,70 @@ static QString watchUrlFor(const QString &videoId) {
 YouTubeBackend::YouTubeBackend(const QString &appRoot, const QString &dataRoot, QObject *parent)
     : QObject(parent), m_appRoot(appRoot), m_dataRoot(dataRoot)
 {
+    loadFeedCache();
+}
+
+void YouTubeBackend::loadFeedCache() {
+    QFile file(m_dataRoot + "/youtube_feed_cache.json");
+    if (!file.open(QIODevice::ReadOnly))
+        return;
+    const QJsonObject cache = QJsonDocument::fromJson(file.readAll()).object();
+    if (cache.value("version").toInt() != 1)
+        return;
+
+    const QJsonObject channels = cache.value("channels").toObject();
+    for (auto iterator = channels.begin(); iterator != channels.end(); ++iterator) {
+        const QJsonObject saved = iterator.value().toObject();
+        ChannelEntry entry;
+        entry.channelId = iterator.key();
+        entry.channelName = saved.value("title").toString();
+        entry.videos = saved.value("videos").toArray().toVariantList();
+        entry.fetchedMs = saved.value("fetchedMs").toVariant().toLongLong();
+        entry.feedOk = entry.fetchedMs > 0;
+        m_channels.insert(entry.channelId, entry);
+    }
+    const QJsonObject playlists = cache.value("playlists").toObject();
+    for (auto iterator = playlists.begin(); iterator != playlists.end(); ++iterator) {
+        const QJsonObject saved = iterator.value().toObject();
+        PlaylistEntry entry;
+        entry.playlistId = iterator.key();
+        entry.fetchedTitle = saved.value("title").toString();
+        entry.videos = saved.value("videos").toArray().toVariantList();
+        entry.fetchedMs = saved.value("fetchedMs").toVariant().toLongLong();
+        entry.fetchOk = entry.fetchedMs > 0;
+        m_playlists.insert(entry.playlistId, entry);
+    }
+}
+
+void YouTubeBackend::saveFeedCache() const {
+    QJsonObject channels;
+    for (auto iterator = m_channels.constBegin(); iterator != m_channels.constEnd(); ++iterator) {
+        const ChannelEntry &entry = iterator.value();
+        if (entry.feedOk)
+            channels.insert(iterator.key(), QJsonObject{
+                {"title", entry.channelName},
+                {"videos", QJsonArray::fromVariantList(entry.videos)},
+                {"fetchedMs", entry.fetchedMs}
+            });
+    }
+    QJsonObject playlists;
+    for (auto iterator = m_playlists.constBegin(); iterator != m_playlists.constEnd(); ++iterator) {
+        const PlaylistEntry &entry = iterator.value();
+        if (entry.fetchOk)
+            playlists.insert(iterator.key(), QJsonObject{
+                {"title", entry.fetchedTitle},
+                {"videos", QJsonArray::fromVariantList(entry.videos)},
+                {"fetchedMs", entry.fetchedMs}
+            });
+    }
+    QSaveFile file(m_dataRoot + "/youtube_feed_cache.json");
+    if (!file.open(QIODevice::WriteOnly))
+        return;
+    const QByteArray data = QJsonDocument(QJsonObject{
+        {"version", 1}, {"channels", channels}, {"playlists", playlists}
+    }).toJson(QJsonDocument::Compact);
+    if (file.write(data) == data.size())
+        file.commit();
 }
 
 // ---------------------------------------------------------------------------
@@ -96,13 +161,10 @@ void YouTubeBackend::load_channels(bool forceRefresh) {
 
 void YouTubeBackend::load_channel_videos(const QString &channelId, bool forceRefresh) {
     m_emitChannelVideosWhenDone = channelId;
-    ensureFresh(forceRefresh);
+    ensureFresh(forceRefresh, channelId);
 }
 
-void YouTubeBackend::ensureFresh(bool forceRefresh) {
-    if (m_pendingChannels > 0)
-        return; // refresh already in flight — the emit flags queue on it
-
+void YouTubeBackend::ensureFresh(bool forceRefresh, const QString &selectedChannelId) {
     QString error;
     const QStringList ids = readSubscriptionIds(&error);
     if (ids.isEmpty()) {
@@ -114,21 +176,44 @@ void YouTubeBackend::ensureFresh(bool forceRefresh) {
     }
     m_channelOrder = ids;
 
-    const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    QStringList stale;
-    for (const QString &id : ids) {
+    if (!forceRefresh) {
+        bool anyCached = false;
+        for (const QString &id : ids)
+            anyCached = anyCached || m_channels.value(id).feedOk;
+        if (anyCached && m_emitFeedWhenDone) {
+            m_emitFeedWhenDone = false;
+            emit subscriptionsFeedLoaded(buildFeed());
+        }
+        if (anyCached && m_emitChannelsWhenDone) {
+            m_emitChannelsWhenDone = false;
+            emit channelsLoaded(buildChannelList());
+        }
+        if (!m_emitChannelVideosWhenDone.isEmpty()
+            && m_channels.value(m_emitChannelVideosWhenDone).feedOk) {
+            const QString channelId = m_emitChannelVideosWhenDone;
+            m_emitChannelVideosWhenDone.clear();
+            emit channelVideosLoaded(channelId, m_channels.value(channelId).videos);
+        }
+    }
+    QStringList toFetch;
+    const QStringList candidates = selectedChannelId.isEmpty() ? ids : QStringList{selectedChannelId};
+    for (const QString &id : candidates) {
         ChannelEntry &entry = m_channels[id];
         entry.channelId = id;
-        if (forceRefresh || !entry.feedOk || now - entry.fetchedMs > kCacheTtlMs)
-            stale << id;
+        if (!m_channelFetches.contains(id)
+            && (forceRefresh || !selectedChannelId.isEmpty() || !entry.feedOk))
+            toFetch << id;
     }
 
-    if (stale.isEmpty()) {
-        finishAggregate(); // everything fresh — serve from cache
+    if (toFetch.isEmpty()) {
+        if (m_pendingChannels == 0)
+            finishAggregate();
         return;
     }
-    m_pendingChannels = stale.size();
-    for (const QString &id : stale)
+    m_pendingChannels += toFetch.size();
+    for (const QString &id : toFetch)
+        m_channelFetches.insert(id);
+    for (const QString &id : toFetch)
         refreshChannel(id);
 }
 
@@ -223,8 +308,10 @@ void YouTubeBackend::refreshChannel(const QString &channelId) {
         }
         // On failure: keep any previously cached videos (stale beats empty);
         // fetchedMs stays old so the next load retries this channel.
+        m_channelFetches.remove(channelId);
         if (--m_pendingChannels <= 0) {
             m_pendingChannels = 0;
+            saveFeedCache();
             finishAggregate();
         }
     });
@@ -237,6 +324,9 @@ void YouTubeBackend::finishAggregate() {
     m_emitFeedWhenDone     = false;
     m_emitChannelsWhenDone = false;
     m_emitChannelVideosWhenDone.clear();
+
+    if (!feedWanted && !channelsWanted && videosWanted.isEmpty())
+        return;
 
     bool anyOk = false;
     for (const QString &id : m_channelOrder)
@@ -376,13 +466,10 @@ void YouTubeBackend::load_playlists(bool forceRefresh) {
 
 void YouTubeBackend::load_playlist_videos(const QString &playlistId, bool forceRefresh) {
     m_emitPlaylistVideosWhenDone = playlistId;
-    ensurePlaylistsFresh(forceRefresh);
+    ensurePlaylistsFresh(forceRefresh, playlistId);
 }
 
-void YouTubeBackend::ensurePlaylistsFresh(bool forceRefresh) {
-    if (m_pendingPlaylists > 0)
-        return; // refresh already in flight — the emit flags queue on it
-
+void YouTubeBackend::ensurePlaylistsFresh(bool forceRefresh, const QString &selectedPlaylistId) {
     QString error;
     const QList<PlaylistFileRef> refs = readPlaylistEntries(&error);
     if (refs.isEmpty()) {
@@ -399,27 +486,51 @@ void YouTubeBackend::ensurePlaylistsFresh(bool forceRefresh) {
         entry.fileName   = ref.name; // re-read every refresh so file edits apply
     }
 
-    const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    QStringList stale;
-    for (const QString &id : m_playlistOrder) {
+    if (!forceRefresh) {
+        bool anyCached = false;
+        for (const QString &id : m_playlistOrder)
+            anyCached = anyCached || m_playlists.value(id).fetchOk;
+        if (anyCached && m_emitPlaylistsWhenDone) {
+            m_emitPlaylistsWhenDone = false;
+            emit playlistsLoaded(buildPlaylistList());
+        }
+        if (!m_emitPlaylistVideosWhenDone.isEmpty()
+            && m_playlists.value(m_emitPlaylistVideosWhenDone).fetchOk) {
+            const QString playlistId = m_emitPlaylistVideosWhenDone;
+            m_emitPlaylistVideosWhenDone.clear();
+            emit playlistVideosLoaded(playlistId, m_playlists.value(playlistId).videos);
+        }
+    }
+    QStringList toFetch;
+    const QStringList candidates = selectedPlaylistId.isEmpty()
+        ? m_playlistOrder : QStringList{selectedPlaylistId};
+    for (const QString &id : candidates) {
         const PlaylistEntry &entry = m_playlists.value(id);
-        if (forceRefresh || !entry.fetchOk || now - entry.fetchedMs > kCacheTtlMs)
-            stale << id;
+        if (!m_playlistFetches.contains(id)
+            && (forceRefresh || !selectedPlaylistId.isEmpty() || !entry.fetchOk))
+            toFetch << id;
     }
 
-    if (stale.isEmpty()) {
-        finishPlaylistAggregate(); // everything fresh — serve from cache
+    if (toFetch.isEmpty()) {
+        if (m_pendingPlaylists == 0)
+            finishPlaylistAggregate();
         return;
     }
     // Resolve the same user-updatable yt-dlp mpv's ytdl_hook will use at
     // playback time (data-dir drop-in → sibling → PATH), so app and mpv agree.
     if (ytdlp::locate(m_dataRoot).isEmpty()) {
         // Nothing can be fetched; report against whatever the cache holds.
-        finishPlaylistAggregate();
+        if (m_pendingPlaylists == 0)
+            finishPlaylistAggregate();
         return;
     }
-    m_pendingPlaylists   = stale.size();
-    m_playlistFetchQueue = stale;
+    m_pendingPlaylists += toFetch.size();
+    for (const QString &id : toFetch)
+        m_playlistFetches.insert(id);
+    if (selectedPlaylistId.isEmpty())
+        m_playlistFetchQueue.append(toFetch);
+    else
+        m_playlistFetchQueue.prepend(selectedPlaylistId);
     spawnNextPlaylistFetch();
 }
 
@@ -489,11 +600,13 @@ void YouTubeBackend::spawnNextPlaylistFetch() {
             }
             // On failure: keep any previously cached videos (stale beats empty)
 
+            m_playlistFetches.remove(playlistId);
             --m_activePlaylistFetches;
             if (--m_pendingPlaylists <= 0) {
                 m_pendingPlaylists      = 0;
                 m_activePlaylistFetches = 0;
                 m_playlistFetchQueue.clear();
+                saveFeedCache();
                 finishPlaylistAggregate();
             } else {
                 spawnNextPlaylistFetch();
@@ -516,6 +629,9 @@ void YouTubeBackend::finishPlaylistAggregate() {
     const QString videosWanted = m_emitPlaylistVideosWhenDone;
     m_emitPlaylistsWhenDone = false;
     m_emitPlaylistVideosWhenDone.clear();
+
+    if (!listWanted && videosWanted.isEmpty())
+        return;
 
     bool anyOk = false;
     for (const QString &id : m_playlistOrder)
