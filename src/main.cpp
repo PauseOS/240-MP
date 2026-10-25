@@ -72,6 +72,14 @@ static volatile std::sig_atomic_t g_termRequested = 0;
 extern "C" void mp240HandleTerm(int) { g_termRequested = 1; }
 
 int main(int argc, char *argv[]) {
+    // On Raspberry Pi EGLFS, connecting a controller can show a cursor despite
+    // the BlankCursor override below. Disable the EGLFS cursor at startup:
+    // Qt reads this variable when creating its platform cursor, so set it
+    // before constructing QGuiApplication, not alongside setOverrideCursor.
+#ifdef Q_OS_LINUX
+    qputenv("QT_QPA_EGLFS_HIDECURSOR", "1");
+#endif
+
     QGuiApplication app(argc, argv);
     app.setApplicationName("240-MP");
     app.setApplicationVersion(QStringLiteral(APP_VERSION));
